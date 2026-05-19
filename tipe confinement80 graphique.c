@@ -3,36 +3,46 @@
 #include <stdbool.h>
 #include <math.h>
 #include <time.h>
-
-
-
-
+#include <string.h> // Ajouté pour memcpy
 
 typedef struct Agent {
     int id;
     int pos_x;
     int pos_y;
-    int infected_steps; // Nombre de steps que l'agent est infecté
-    bool S;// Status asymptomatique
-    bool I;// Status infecté
-    bool R;// Status recupéré
-    bool D;// Status mort
-    bool C; // Statut confinement
-    bool A; // Status asymptomatique
-
+    int infected_steps;
+    bool S;
+    bool I;
+    bool R;
+    bool D;
+    bool C;
+    bool A;
 } Agent;
 
 typedef struct Simulation {
     Agent* agents;
     int num_agents;
-    int time_steps; //nombre d'étapes max
-    int infection_radius; //distance à laquelle une infection peut se produire
-    int recover_probability; //probabilité de guérison à chaque étape
-    int infection_probability; //probabilité d'infection à chaque étape !!(probabilité par agent, donc change en fonction de la densité de pop c'est a dire du nombre d'agents dans le rayon d'infection, donc en fonction du nomnbre d'agents ET du rayon d'infection))!!
-    int death_probability; //probabilité de mourir à chaque étape
-    int confinement_threshold; //seuil d'infectés pour déclencher le confinement
-    bool threshold_reached; // Indique si le seuil de x  infectés a été atteint
-    bool confinement_active; // Indique si les mesures de confinement sont actuellement actives
+    int time_steps;
+    int infection_radius;
+    int recover_probability;
+    int infection_probability;
+    int death_probability;
+    int confinement_threshold;
+    bool threshold_reached;
+    bool confinement_active;
+
+    // --- NOUVEAUX CHAMPS POUR L'OPTIMISATION ---
+    
+    // 1. Double Buffering : Évite de faire malloc/free à chaque étape
+    Agent* new_agents; 
+    
+    // 2. Variables de la Grille Spatiale (Spatial Hash)
+    int grid_cell_size; // La taille d'une cellule (égale au rayon d'infection)
+    int grid_width;     // Le nombre de cellules sur une ligne (ex: 1000 / 40)
+    int num_cells;      // Le nombre total de cellules (width * width)
+    
+    // Les deux tableaux du Spatial Hash
+    int* cell_head;  // Contient l'ID du premier agent dans chaque cellule
+    int* agent_next; // Contient l'ID de l'agent suivant dans la même cellule
 
 } Simulation;
 
@@ -49,23 +59,44 @@ Simulation* create_simulation(int num_agents, int time_steps, int infection_radi
     sim->threshold_reached = false;
     sim->confinement_active = confinement_active;
 
+    // --- INITIALISATION DE L'OPTIMISATION ---
+    
+    // On alloue new_agents UNE SEULE FOIS au début
+    sim->new_agents = (Agent*)malloc(num_agents * sizeof(Agent));
+
+    // La taille de la cellule s'adapte à ton rayon variable
+    sim->grid_cell_size = (infection_radius > 0) ? infection_radius : 10;
+    
+    // On ajoute +1 pour s'assurer que les agents aux bords (x=999) ont bien une cellule
+    sim->grid_width = (1000 / sim->grid_cell_size) + 1;
+    sim->num_cells = sim->grid_width * sim->grid_width;
+
+    // On alloue les tableaux de notre "classeur" spatial
+    sim->cell_head = (int*)malloc(sim->num_cells * sizeof(int));
+    sim->agent_next = (int*)malloc(num_agents * sizeof(int));
+
     // Initialize agents
     for (int i = 0; i < num_agents; i++) {
         sim->agents[i].id = i;
-        sim->agents[i].pos_x = rand() % 1000; // Position initiale aleatoire
+        sim->agents[i].pos_x = rand() % 1000;
         sim->agents[i].pos_y = rand() % 1000;
-        sim->agents[i].S = true; // tout les agents démarrent susceptible
+        sim->agents[i].S = true;
         sim->agents[i].I = false;
         sim->agents[i].R = false;
         sim->agents[i].D = false;
-        sim->agents[i].C = false; // All agents start as not confined
-        sim->agents[i].infected_steps = 0; // Initialize infected steps to 0
+        sim->agents[i].C = false;
+        sim->agents[i].infected_steps = 0;
+        sim->agents[i].A = false; // Initialisé pour éviter des bugs de mémoire
     }
 
     return sim;
 }
 
 void destroy_simulation(Simulation* sim) {
+    // N'oublie pas de libérer les nouveaux tableaux pour éviter les fuites de mémoire
+    free(sim->new_agents);
+    free(sim->cell_head);
+    free(sim->agent_next);
     free(sim->agents);
     free(sim);
 }
@@ -85,8 +116,6 @@ int* get_state(Simulation* sim, int* state) {
     return state;
 }
 
-
-
 int distance(Agent* a, Agent* b) {
     return abs(a->pos_x - b->pos_x) + abs(a->pos_y - b->pos_y);
 }
@@ -97,9 +126,8 @@ int max_int(int a, int b) {
 
 void movement(Agent* agent, Agent* new_agent) {
     if (rand () % 100 < 30) { 
-        new_agent->pos_x = agent->pos_x + (rand() % 9) - 4; // +4 -4
-        new_agent->pos_y = agent->pos_y + (rand() % 9) - 4; // +4 -4
-        //  
+        new_agent->pos_x = agent->pos_x + (rand() % 9) - 4;
+        new_agent->pos_y = agent->pos_y + (rand() % 9) - 4;
     }
     
     if (!(agent->C)) {
@@ -107,63 +135,118 @@ void movement(Agent* agent, Agent* new_agent) {
         if (new_agent->pos_x > 999) new_agent->pos_x = 999;
         if (new_agent->pos_y < 0) new_agent->pos_y = 0;
         if (new_agent->pos_y > 999) new_agent->pos_y = 999; 
-    }
-    else{
+    } else {
         new_agent->pos_x = agent->pos_x;
-        new_agent->pos_y = agent->pos_y; // les confinés ne se déplacent pas
-
+        new_agent->pos_y = agent->pos_y;
     }
 }
+
 void step(Simulation* sim) {
-    Agent* new_agents = (Agent*)malloc(sim->num_agents * sizeof(Agent));
-    for (int i = 0; i < sim->num_agents; i++) {
-        new_agents[i] = sim->agents[i]; // On copie l'état des agents dans new_agents pour pouvoir les mettre à jour simultanément
+    // POURQUOI : On copie la mémoire d'un coup (très rapide) au lieu de faire malloc/free
+    memcpy(sim->new_agents, sim->agents, sim->num_agents * sizeof(Agent));
+
+    // --- 1. RÉINITIALISER LA GRILLE ---
+    // POURQUOI : On vide le classeur à chaque étape (la valeur -1 signifie "vide")
+    for (int i = 0; i < sim->num_cells; i++) {
+        sim->cell_head[i] = -1;
     }
 
+    // --- 2. PLACER LES AGENTS DANS LA GRILLE ---
+    // POURQUOI : On range chaque agent dans le bon dossier une seule fois
     for (int i = 0; i < sim->num_agents; i++) {
-        movement(&sim->agents[i], &new_agents[i]);
+        // Les morts et confinés (qui sont à 1750, hors de la carte) ne transmettent pas
+        // On les ignore pour éviter qu'ils fassent planter les limites de la grille
+        if (sim->agents[i].D || sim->agents[i].C) continue; 
+
+        int cx = sim->agents[i].pos_x / sim->grid_cell_size;
+        int cy = sim->agents[i].pos_y / sim->grid_cell_size;
+        
+        // Sécurité pour rester dans les limites du tableau
+        if (cx < 0) cx = 0; else if (cx >= sim->grid_width) cx = sim->grid_width - 1;
+        if (cy < 0) cy = 0; else if (cy >= sim->grid_width) cy = sim->grid_width - 1;
+        
+        int cell_idx = cy * sim->grid_width + cx;
+        
+        // On ajoute l'agent au début de la liste chaînée de sa cellule
+        sim->agent_next[i] = sim->cell_head[cell_idx];
+        sim->cell_head[cell_idx] = i;
+    }
+
+    // --- 3. TRAITEMENT ---
+    for (int i = 0; i < sim->num_agents; i++) {
+        movement(&sim->agents[i], &sim->new_agents[i]);
+        
         if (sim->agents[i].I) {
-            new_agents[i].infected_steps++;
+            sim->new_agents[i].infected_steps++;
+            
             if (sim->agents[i].infected_steps >= 30 && !sim->agents[i].C) {
-                for (int j = 0; j < sim->num_agents; j++) {
-                    if (sim->agents[j].S && distance(&sim->agents[i], &sim->agents[j]) <= sim->infection_radius && rand() % 100 < sim->infection_probability) {
-                        if (rand() % 100 < 0) { // 20% d'etre asymptomatique
-                            new_agents[j].A = true;
+                
+                // On trouve dans quelle cellule se trouve l'infecté
+                int my_cx = sim->agents[i].pos_x / sim->grid_cell_size;
+                int my_cy = sim->agents[i].pos_y / sim->grid_cell_size;
+
+                // POURQUOI : On boucle UNIQUEMENT sur les 9 cellules locales
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dy = -1; dy <= 1; dy++) {
+                        int nx = my_cx + dx;
+                        int ny = my_cy + dy;
+                        
+                        // Si la cellule voisine est bien dans la carte
+                        if (nx >= 0 && nx < sim->grid_width && ny >= 0 && ny < sim->grid_width) {
+                            int cell_idx = ny * sim->grid_width + nx;
+                            
+                            // On parcourt la liste chaînée des agents présents dans cette cellule
+                            int target = sim->cell_head[cell_idx];
+                            while (target != -1) {
+                                // On vérifie la distance uniquement avec ces agents proches
+                                if (sim->agents[target].S && distance(&sim->agents[i], &sim->agents[target]) <= sim->infection_radius) {
+                                    if (rand() % 100 < sim->infection_probability) {
+                                        if (rand() % 100 < 0) { // Ton code d'origine avait 0 ici (20% en commentaire)
+                                            sim->new_agents[target].A = true;
+                                        }
+                                        sim->new_agents[target].S = false;
+                                        sim->new_agents[target].I = true;
+                                    }
+                                }
+                                // On passe à l'agent suivant dans la même cellule
+                                target = sim->agent_next[target];
+                            }
                         }
-                        new_agents[j].S = false;
-                        new_agents[j].I = true;
                     }
                 }
+
+                // Logique de guérison / mort / confinement (intact)
                 if (rand() % 100 < sim->recover_probability) {
-                    new_agents[i].I = false;
-                    new_agents[i].R = true;
+                    sim->new_agents[i].I = false;
+                    sim->new_agents[i].R = true;
                 }
                 else if (rand() % 100 < sim->death_probability) {
-                    new_agents[i].I = false;
-                    new_agents[i].R = false; 
-                    new_agents[i].D = true; 
+                    sim->new_agents[i].I = false;
+                    sim->new_agents[i].R = false; 
+                    sim->new_agents[i].D = true; 
                 }
+                
                 if (! (sim->agents[i].A) && !(sim->agents[i].C) && sim->threshold_reached && sim->agents[i].infected_steps >= 15 && sim->confinement_active){ 
-                    new_agents[i].C = true;
-                    new_agents[i].pos_x = 1750;  // Deplacer en confinement
-                    new_agents[i].pos_y = 1750;
+                    sim->new_agents[i].C = true;
+                    sim->new_agents[i].pos_x = 1750;  
+                    sim->new_agents[i].pos_y = 1750;
                 }
+            }
         }
-        
     }
-    for (int i = 0; i < sim->num_agents; i++) {
-        sim->agents[i] = new_agents[i];
-    }}
-    free(new_agents);
 
-    
+    // --- 4. SWAP DES POINTEURS ---
+    // POURQUOI : Au lieu de recopier ou de faire free(), on échange juste les étiquettes.
+    Agent* temp = sim->agents;
+    sim->agents = sim->new_agents;
+    sim->new_agents = temp;
 }
+
 void run_simulation(Simulation* sim) {
     int steps = 0;
     int* state = (int*)malloc(4 * sizeof(int));
     int max_i = 0;
 
-    
     for (int i = 0; i < 10; i++) {
         sim->agents[i].S = false;
         sim->agents[i].I = true;
@@ -183,7 +266,6 @@ void run_simulation(Simulation* sim) {
 
     while (state[1] > 0 && steps < sim->time_steps) {
         fprintf(file, "%d,%d,%d,%d,%d\n", steps, state[0], state[1], state[2], state[3]);
-        
         
         if (steps % 5 == 0) {
             for (int i = 0; i < sim->num_agents; i++) {
@@ -220,9 +302,6 @@ void run_simulation(Simulation* sim) {
     free(state);
 }
 
-
-
-
 int main() {
     int recover_probability;
     int infection_probability;
@@ -256,7 +335,7 @@ int main() {
         time_steps = 1000;    
         infection_radius = 40;   
         confinement_threshold = 50;
-        confinement_active = false;
+        confinement_active = true;
     }
     
     srand(time(NULL));
@@ -264,7 +343,5 @@ int main() {
     run_simulation(sim);
     destroy_simulation(sim);
     
-
     return 0;
 }
-
